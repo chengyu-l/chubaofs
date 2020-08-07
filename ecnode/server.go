@@ -81,11 +81,20 @@ type EcNode struct {
 	tcpListener net.Listener
 	stopC       chan bool
 
-	control common.Control
+	control     common.Control
+	repairEvent chan repairEvent
+}
+
+type repairEvent struct {
+	ep                   EcPartition
+	maxExtentInfoEcNode  *extentInfoEcNode
+	extentInfoEcNodeList []*extentInfoEcNode
 }
 
 func NewServer() *EcNode {
-	return &EcNode{}
+	return &EcNode{
+		repairEvent: make(chan repairEvent, 1000),
+	}
 }
 
 func (e *EcNode) Start(cfg *config.Config) (err error) {
@@ -127,6 +136,8 @@ func doStart(server common.Server, cfg *config.Config) (err error) {
 		return
 	}
 	//go e.registerHandler()
+
+	e.startDataRepairService()
 
 	return
 }
@@ -272,4 +283,20 @@ func (e *EcNode) register(cfg *config.Config) {
 			return
 		}
 	}
+}
+
+func (e *EcNode) startDataRepairService() {
+	go func() {
+		for {
+			select {
+			case event := <-e.repairEvent:
+				if &event.ep == nil || event.maxExtentInfoEcNode == nil && len(event.extentInfoEcNodeList) == 0 {
+					log.LogWarnf("PartitionID(%v) because of invalid data, no need to check and repair data", event.ep.PartitionID)
+					return
+				}
+
+				event.ep.repairPartitionData(e, event.maxExtentInfoEcNode, event.extentInfoEcNodeList)
+			}
+		}
+	}()
 }

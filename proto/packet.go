@@ -146,8 +146,6 @@ const (
 	OpIssueMigrationTask uint8 = 0xA1
 	//Operations: CodecNode -> Meta
 	OpMetaBatchCompleteMigrate uint8 = 0xA2
-	//Operations: EcNode -> EcNode
-	OpListExtentsInPartition uint8 = 0xA3
 
 	//Operations: Master -> EcNode
 	OpEcNodeHeartbeat          uint8 = 0xB0
@@ -156,6 +154,9 @@ const (
 	OpParityEcDataPartition    uint8 = 0xB3
 	OpChangeEcPartitionMembers uint8 = 0xB4
 	OpDecommissionEcPartition  uint8 = 0xB5
+	OpUpdateEcDataPartition    uint8 = 0xB6
+	OpEcExtentValidate         uint8 = 0xB7
+	OpEcExtentRepair           uint8 = 0xB8
 
 	// Commons
 	OpIntraGroupNetErr uint8 = 0xF3

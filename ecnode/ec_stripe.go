@@ -1,29 +1,32 @@
 package ecnode
 
 import (
-	"errors"
 	"fmt"
 	"github.com/chubaofs/chubaofs/codecnode"
 	"github.com/chubaofs/chubaofs/proto"
 	"github.com/chubaofs/chubaofs/repl"
+	"github.com/chubaofs/chubaofs/storage"
+	"github.com/chubaofs/chubaofs/util"
+	"github.com/chubaofs/chubaofs/util/errors"
 	"github.com/chubaofs/chubaofs/util/log"
 	"github.com/shopspring/decimal"
 	"hash/crc32"
 	"sync"
 )
 
-type ecExtent struct {
+type ecStripe struct {
 	e               *EcNode
 	ep              *EcPartition
 	partitionId     uint64
 	extentID        uint64
 	dataSize        uint64
-	partitySize     uint64
+	paritySize      uint64
 	localServerAddr string
 	hosts           []string
+	coder           *codecnode.EcHandler
 }
 
-func NewEcExtent(e *EcNode, ep *EcPartition, extentID uint64) *ecExtent {
+func NewEcStripe(e *EcNode, ep *EcPartition, extentID uint64) (*ecStripe, error) {
 	nodeNum := int(ep.DataNodeNum + ep.ParityNodeNum)
 	nodeIndex := int(extentID % uint64(nodeNum))
 	hosts := make([]string, nodeNum)
@@ -36,50 +39,55 @@ func NewEcExtent(e *EcNode, ep *EcPartition, extentID uint64) *ecExtent {
 		nodeIndex = nodeIndex + 1
 	}
 
-	return &ecExtent{
+	coder, err := codecnode.NewEcCoder(int(ep.StripeUnitSize), int(ep.DataNodeNum), int(ep.ParityNodeNum))
+	if err != nil {
+		log.LogErrorf("NewEcCoder fail. err:%v", err)
+		return nil, errors.NewErrorf("NewEcCoder fail. err:%v", err)
+	}
+
+	return &ecStripe{
 		e:               e,
 		ep:              ep,
 		partitionId:     ep.PartitionID,
 		extentID:        extentID,
 		dataSize:        ep.StripeUnitSize * uint64(ep.DataNodeNum),
-		partitySize:     ep.StripeUnitSize * uint64(ep.ParityNodeNum),
+		paritySize:      ep.StripeUnitSize * uint64(ep.ParityNodeNum),
 		localServerAddr: e.localServerAddr,
 		hosts:           hosts,
-	}
+		coder:           coder,
+	}, nil
 }
 
-func (ee *ecExtent) readStripe(index int, nodeAddr string, offset uint64, wg *sync.WaitGroup, data [][]byte) {
+func (ee *ecStripe) readStripe(nodeAddr string, offset uint64, curReadSize uint64, wg *sync.WaitGroup) (data []byte) {
 	defer wg.Done()
 
 	if nodeAddr == ee.localServerAddr {
-		// read locality
-		data[index] = make([]byte, ee.ep.StripeUnitSize)
-		_, err := ee.readExtentFile(offset, ee.ep.StripeUnitSize, data[index])
+		// read local
+		data = make([]byte, ee.ep.StripeUnitSize)
+		_, err := ee.readExtentFile(offset, curReadSize, data)
 		if err != nil {
-			log.LogErrorf("read locality[%v] fail. partitionId[%v] extentId[%v] offset[%v] index[%v] err:%v",
-				nodeAddr, ee.partitionId, ee.extentID, offset, index, err)
+			log.LogWarnf("read local[%v] fail. partitionId[%v] extentId[%v] offset[%v] err:%v",
+				nodeAddr, ee.partitionId, ee.extentID, offset, err)
+			data = nil
 			return
 		}
-
-		log.LogDebugf("read locality[%v]. partitionId[%v] extentId[%v] offset[%v] index[%v]",
-			nodeAddr, ee.partitionId, ee.extentID, offset, index)
 	} else {
 		// read from remote node
-		request := repl.NewExtentStripeRead(ee.partitionId, ee.extentID, offset, ee.ep.StripeUnitSize)
+		request := repl.NewExtentStripeRead(ee.partitionId, ee.extentID, offset, curReadSize)
 		err := DoRequest(request, nodeAddr, proto.ReadDeadlineTime)
 		if err != nil || request.ResultCode != proto.OpOk {
-			log.LogErrorf("read from remote[%v] fail. packet:%v offset[%v] size[%v] crc[%v] index[%v] err:%v",
-				nodeAddr, request, offset, request.Size, request.CRC, index, err)
+			log.LogWarnf("read from remote[%v] fail. partitionId[%v] extentId[%v] offset[%v] size[%v] crc[%v] err:%v",
+				nodeAddr, ee.partitionId, ee.extentID, offset, request.Size, request.CRC, err)
 			return
 		}
 
-		log.LogDebugf("read from remote[%v]. packet:%v offset[%v] size[%v] crc[%v] index[%v]",
-			nodeAddr, request, offset, request.Size, request.CRC, index)
-		data[index] = request.Data
+		data = request.Data
 	}
+
+	return
 }
 
-func (ee *ecExtent) readExtentFile(offset uint64, size uint64, data []byte) (uint32, error) {
+func (ee *ecStripe) readExtentFile(offset uint64, size uint64, data []byte) (uint32, error) {
 	if ee.ep == nil {
 		return 0, proto.ErrNoAvailEcPartition
 	}
@@ -92,18 +100,19 @@ func (ee *ecExtent) readExtentFile(offset uint64, size uint64, data []byte) (uin
 	return store.Read(ee.extentID, int64(offset), int64(size), data, false)
 }
 
-func (ee *ecExtent) readStripeData(nodeAddr string, extentFileOffset, curReadSize uint64) (data []byte, crc uint32, err error) {
+func (ee *ecStripe) readStripeData(nodeAddr string, extentFileOffset, curReadSize uint64) (data []byte, crc uint32, err error) {
 	if nodeAddr == ee.localServerAddr {
-		// read locality
+		// read local
 		data = make([]byte, curReadSize)
 		crc, err = ee.readExtentFile(extentFileOffset, curReadSize, data)
 		if err != nil {
-			log.LogErrorf("read locality[%v] fail. partitionId[%v] extentId[%v] offset[%v] size[%v] err:%v",
+			log.LogErrorf("read local[%v] fail. partitionId[%v] extentId[%v] offset[%v] size[%v] err:%v",
 				nodeAddr, ee.partitionId, ee.extentID, extentFileOffset, curReadSize, err)
+			data = nil
 			return
 		}
 
-		log.LogDebugf("read locality[%v]. partitionId[%v] extentId[%v] offset[%v] size[%v]",
+		log.LogDebugf("read local[%v]. partitionId[%v] extentId[%v] offset[%v] size[%v]",
 			nodeAddr, ee.partitionId, ee.extentID, extentFileOffset, curReadSize)
 	} else {
 		// read from remote node
@@ -124,7 +133,7 @@ func (ee *ecExtent) readStripeData(nodeAddr string, extentFileOffset, curReadSiz
 	return
 }
 
-func (ee *ecExtent) calcNode(extentOffset uint64) string {
+func (ee *ecStripe) calcNode(extentOffset uint64) string {
 	stripeUnitSizeDecimal := decimal.NewFromInt(int64(ee.ep.StripeUnitSize))
 	extentOffsetDecimal := decimal.NewFromInt(int64(extentOffset))
 	div := extentOffsetDecimal.Div(stripeUnitSizeDecimal).Floor()
@@ -135,7 +144,7 @@ func (ee *ecExtent) calcNode(extentOffset uint64) string {
 	return ee.hosts[index]
 }
 
-func (ee *ecExtent) calcExtentFileOffset(extentOffset uint64) uint64 {
+func (ee *ecStripe) calcExtentFileOffset(extentOffset uint64) uint64 {
 	stripeUnitSizeDecimal := decimal.NewFromInt(int64(ee.ep.StripeUnitSize))
 	extentOffsetDecimal := decimal.NewFromInt(int64(extentOffset))
 	div := extentOffsetDecimal.Div(stripeUnitSizeDecimal).Floor()
@@ -144,7 +153,7 @@ func (ee *ecExtent) calcExtentFileOffset(extentOffset uint64) uint64 {
 	return uint64(stripeN)*ee.ep.StripeUnitSize + uint64(offset)
 }
 
-func (ee *ecExtent) calcCanReadSize(extentOffset uint64, canReadSize uint64) uint64 {
+func (ee *ecStripe) calcCanReadSize(extentOffset uint64, canReadSize uint64) uint64 {
 	canReadSizeInStripeUnit := ee.ep.StripeUnitSize - extentOffset%ee.ep.StripeUnitSize
 	if canReadSize < canReadSizeInStripeUnit {
 		return canReadSize
@@ -153,85 +162,183 @@ func (ee *ecExtent) calcCanReadSize(extentOffset uint64, canReadSize uint64) uin
 	}
 }
 
-func (ee *ecExtent) reconstructStripeData(nodeAddr string, extentFileOffset, curReadSize uint64) ([]byte, error) {
-	log.LogDebugf("reconstructStripeData")
-	data := ee.readStripeFromFollower(extentFileOffset)
+func (ee *ecStripe) reconstructStripeData(extentFileOffset, curReadSize uint64) (data [][]byte, validDataBitmap []byte, err error) {
+	data = ee.readStripeAllEcNode(extentFileOffset, curReadSize)
+	validDataBitmap = make([]byte, len(ee.hosts))
 	validDataCount := 0
-	nodeIndex := 0
-	for i := 0; i < len(ee.hosts); i++ {
-		if nodeAddr == ee.hosts[i] {
-			nodeIndex = i
-			if data[i] != nil && len(data[i]) > 0 {
-				return data[i], nil
-			}
-		}
-
-		if data[i] != nil && len(data[i]) > 0 {
+	for i := 0; i < len(validDataBitmap); i++ {
+		if len(data[i]) > 0 {
 			validDataCount += 1
+			validDataBitmap[i] = 1
 		}
 	}
 
-	if validDataCount >= int(ee.ep.DataNodeNum) {
-		err := ee.reconstructData(data)
-		if err != nil {
-			return nil, errors.New("reconstruct data fail")
-		}
-
-		go ee.writeBackReconstructData(nodeAddr, extentFileOffset, data[nodeIndex])
-
-		return data[nodeIndex], nil
-	} else {
-		return nil, errors.New("no enough data for reconstruct")
+	if validDataCount < int(ee.ep.DataNodeNum) {
+		return nil, nil, errors.NewErrorf("PartitionID(%v) ExtentID(%v) not enough data to reconstruct. validDataCount(%v) DataNodeNum(%v)",
+			ee.partitionId, ee.extentID, validDataCount, ee.ep.DataNodeNum)
 	}
+
+	verify, _ := ee.coder.Verify(data)
+	if verify {
+		return data, validDataBitmap, nil
+	}
+
+	// reconstruct data only support the situation that the EcExtent file does not exist.
+	// If the EcExtent file exist, but it have silent data corruption or bit rot problem, it cannot be repaired.
+	// Because we use the reedsolomon library that is not support this action
+	err = ee.reconstructData(data)
+	if err != nil {
+		return nil, nil, errors.NewErrorf("reconstruct data fail, PartitionID(%v) ExtentID(%v) node(%v) offset(%v) validDataBitmap(%v), err:%v",
+			ee.partitionId, ee.extentID, ee.hosts, extentFileOffset, validDataBitmap, err)
+	}
+
+	return data, validDataBitmap, nil
 }
 
-func (ee *ecExtent) readStripeFromFollower(extentFileOffset uint64) [][]byte {
-	ep := ee.ep
-	data := make([][]byte, ep.DataNodeNum+ep.ParityNodeNum)
-	wg := sync.WaitGroup{}
-	wg.Add(int(ep.DataNodeNum))
+func (ee *ecStripe) repairStripeData(extentFileOffset, curReadSize uint64) ([][]byte, error) {
+	data, validDataBitmap, err := ee.reconstructStripeData(extentFileOffset, curReadSize)
+	if err != nil {
+		return nil, err
+	}
 
-	// read from DataNode
+	log.LogDebugf("reconstruct data success, PartitionID(%v) ExtentID(%v) node(%v) offset(%v) validDataBitmap(%v)",
+		ee.partitionId, ee.extentID, ee.hosts, extentFileOffset, validDataBitmap)
+	go ee.writeBackReconstructData(data, validDataBitmap, extentFileOffset)
+	return data, nil
+}
+
+func (ee *ecStripe) readStripeAllEcNode(extentFileOffset uint64, curReadSize uint64) [][]byte {
+	ecNodeNum := ee.ep.DataNodeNum + ee.ep.ParityNodeNum
+	data := make([][]byte, ecNodeNum)
+	wg := sync.WaitGroup{}
+	wg.Add(int(ecNodeNum))
 	for i, nodeAddr := range ee.hosts {
-		go ee.readStripe(i, nodeAddr, extentFileOffset, &wg, data)
+		go func(innerData [][]byte, index int, innerNodeAddr string) {
+			innerData[index] = ee.readStripe(innerNodeAddr, extentFileOffset, curReadSize, &wg)
+			log.LogDebugf("readStripe node(%v) PartitionID(%v) ExtentID(%v) offset(%v) size(%v) len(%v)",
+				innerNodeAddr, ee.partitionId, ee.extentID, extentFileOffset, curReadSize, len(innerData[index]))
+		}(data, i, nodeAddr)
 	}
 
 	wg.Wait()
 	return data
 }
 
-func (ee *ecExtent) reconstructData(pBytes [][]byte) error {
+func (ee *ecStripe) reconstructData(pBytes [][]byte) error {
+	log.LogDebugf("reconstructData, partitionID(%v) extentID(%v)", ee.partitionId, ee.extentID)
 	ep := ee.ep
 	coder, err := codecnode.NewEcCoder(int(ep.StripeUnitSize), int(ep.DataNodeNum), int(ep.ParityNodeNum))
 	if err != nil {
 		return errors.New(fmt.Sprintf("NewEcCoder error:%s", err))
 	}
 
-	err = coder.Reconstruct(pBytes)
-	if err != nil {
-		return errors.New(fmt.Sprintf("reconstruct data error:%s", err))
+	return coder.Reconstruct(pBytes)
+}
+
+// only write back the data that the EcExtent file does not exist.
+// Because we use the reedsolomon library that only support handle this situation.
+func (ee *ecStripe) writeBackReconstructData(data [][]byte, validDataBitmap []byte, extentFileOffset uint64) {
+	for i := 0; i < len(validDataBitmap); i++ {
+		nodeAddr := ee.hosts[i]
+		if validDataBitmap[i] == 1 {
+			continue
+		}
+
+		request := repl.NewPacket()
+		request.ExtentID = ee.extentID
+		request.PartitionID = ee.partitionId
+		request.ExtentOffset = int64(extentFileOffset)
+		request.Size = uint32(len(data[i]))
+		request.Data = data[i]
+		request.CRC = crc32.ChecksumIEEE(data[i])
+		request.Opcode = proto.OpNotifyReplicasToRepair
+		request.ReqID = proto.GenerateRequestID()
+		err := DoRequest(request, nodeAddr, proto.ReadDeadlineTime)
+		// if err not nil, do nothing, only record log
+		if err != nil || request.ResultCode != proto.OpOk {
+			log.LogDebugf("write back reconstruct data. PartitionID(%v) ExtentID(%v) node(%v) offset(%v) size(%v), resultCode(%v) err:%v",
+				ee.partitionId, ee.extentID, nodeAddr, extentFileOffset, len(data[i]), request.ResultCode, err)
+		} else {
+			log.LogDebugf("write back reconstruct data. PartitionID(%v) ExtentID(%v) node(%v) offset(%v) size(%v)",
+				ee.partitionId, ee.extentID, nodeAddr, extentFileOffset, len(data[i]))
+		}
+	}
+}
+
+func (ee *ecStripe) validate() (extentInfo *storage.ExtentInfo, err error) {
+	ep := ee.ep
+	extentInfo, err = ep.ExtentStore().Watermark(ee.extentID)
+	if err != nil || extentInfo == nil {
+		err = fmt.Errorf("extent %v not exist", ee.extentID)
+		return
+	}
+
+	coder, err := codecnode.NewEcCoder(int(ep.StripeUnitSize), int(ep.DataNodeNum), int(ep.ParityNodeNum))
+	if err != nil || coder == nil {
+		err = fmt.Errorf("NewEcCoder fail, err:%v", err)
+		return
+	}
+
+	readSize := extentInfo.Size
+	extentOffset := uint64(0)
+	for {
+		if readSize <= 0 {
+			break
+		}
+
+		data := ee.readStripeAllEcNode(extentOffset, ep.StripeUnitSize)
+		validDataCount := 0
+		for i := 0; i < len(ee.hosts); i++ {
+			if len(data[i]) > 0 {
+				validDataCount += 1
+			}
+		}
+
+		if validDataCount < len(ee.hosts) {
+			err = errors.NewErrorf("not enough data to verify. Partition(%v) ExtentInfo(%v) validDataCount(%v) needDataCount(%v)",
+				ee.partitionId, extentInfo.String(), validDataCount, len(ee.hosts))
+			return extentInfo, err
+		}
+
+		verify, err := coder.Verify(data)
+		if err != nil || !verify {
+			err = fmt.Errorf("verify fail, Partition(%v) ExtentInfo(%v) extentFileOffset(%v) size(%v) verify(%v) err:%v",
+				ee.partitionId, extentInfo.String(), extentOffset, ep.StripeUnitSize, verify, err)
+			return extentInfo, err
+		}
+
+		readSize -= ep.StripeUnitSize
+		extentOffset += ep.StripeUnitSize
+	}
+
+	return
+}
+
+func (ee *ecStripe) writeToExtent(p *repl.Packet, writeType int) (err error) {
+	ep := ee.ep
+	store := ep.extentStore
+	if p.Size <= util.BlockSize {
+		err = store.Write(p.ExtentID, p.ExtentOffset, int64(p.Size), p.Data, p.CRC, writeType, p.IsSyncWrite())
+		ep.checkIsDiskError(err)
+	} else {
+		size := p.Size
+		offset := 0
+		for size > 0 {
+			if size <= 0 {
+				break
+			}
+			currSize := util.Min(int(size), util.BlockSize)
+			data := p.Data[offset : offset+currSize]
+			crc := crc32.ChecksumIEEE(data)
+			err = store.Write(p.ExtentID, p.ExtentOffset+int64(offset), int64(currSize), data, crc, writeType, p.IsSyncWrite())
+			ep.checkIsDiskError(err)
+			if err != nil {
+				break
+			}
+			size -= uint32(currSize)
+			offset += currSize
+		}
 	}
 
 	return err
-}
-
-func (ee *ecExtent) writeBackReconstructData(nodeAddr string, extentFileOffset uint64, data []byte) {
-	request := repl.NewPacket()
-	request.ExtentID = ee.extentID
-	request.PartitionID = ee.partitionId
-	request.ExtentOffset = ee.calcReconstructOffset(extentFileOffset)
-	request.Size = uint32(len(data))
-	request.Data = data
-	request.CRC = crc32.ChecksumIEEE(data)
-	request.Opcode = proto.OpWrite
-	request.ReqID = proto.GenerateRequestID()
-	err := DoRequest(request, nodeAddr, proto.ReadDeadlineTime)
-	if err != nil || request.ResultCode != proto.OpOk {
-		log.LogWarnf("write back reconstruct data to remote[%v] fail. packet:%v offset[%v] size[%v] crc[%v] err:%v",
-			nodeAddr, request, request.ExtentOffset, request.Size, request.CRC, err)
-	}
-}
-
-func (ee *ecExtent) calcReconstructOffset(extentFileOffset uint64) int64 {
-	return int64(extentFileOffset / ee.ep.StripeUnitSize * ee.ep.StripeUnitSize)
 }

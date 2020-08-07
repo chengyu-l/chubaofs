@@ -2,10 +2,10 @@ version: '2.1'
 
 networks:
     extnetwork:
-      ipam:
-         config:
-         - subnet: 192.168.0.0/24
-           gateway: 192.168.0.1
+        ipam:
+            config:
+                - subnet: 192.168.0.0/24
+                  gateway: 192.168.0.1
 
 services:
     monitor:
@@ -439,7 +439,7 @@ services:
         restart: on-failure
         privileged: true
         environment:
-          - TZ=Asia/Shanghai
+            - TZ=Asia/Shanghai
         networks:
             extnetwork:
                 ipv4_address: 192.168.0.61
@@ -458,7 +458,7 @@ services:
         restart: on-failure
         privileged: true
         environment:
-          - TZ=Asia/Shanghai
+            - TZ=Asia/Shanghai
         networks:
             extnetwork:
                 ipv4_address: 192.168.0.62
@@ -477,7 +477,7 @@ services:
         restart: on-failure
         privileged: true
         environment:
-          - TZ=Asia/Shanghai
+            - TZ=Asia/Shanghai
         networks:
             extnetwork:
                 ipv4_address: 192.168.0.63
@@ -496,7 +496,7 @@ services:
         restart: on-failure
         privileged: true
         environment:
-          - TZ=Asia/Shanghai
+            - TZ=Asia/Shanghai
         networks:
             extnetwork:
                 ipv4_address: 192.168.0.41
@@ -515,7 +515,7 @@ services:
         restart: on-failure
         privileged: true
         environment:
-          - TZ=Asia/Shanghai
+            - TZ=Asia/Shanghai
         networks:
             extnetwork:
                 ipv4_address: 192.168.0.42
@@ -534,7 +534,7 @@ services:
         restart: on-failure
         privileged: true
         environment:
-          - TZ=Asia/Shanghai
+            - TZ=Asia/Shanghai
         networks:
             extnetwork:
                 ipv4_address: 192.168.0.43
@@ -630,8 +630,8 @@ services:
             - bash
             - "-c"
             - >-
-              set -e;
-              mkdir -p /go/src/github.com/chubaofs/chubaofs/docker/bin &&
-              cd /go/src/github.com/chubaofs/chubaofs && make test
+                set -e;
+                mkdir -p /go/src/github.com/chubaofs/chubaofs/docker/bin &&
+                cd /go/src/github.com/chubaofs/chubaofs && make test
         networks:
             extnetwork:

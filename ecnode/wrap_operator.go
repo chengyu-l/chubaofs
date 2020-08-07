@@ -20,13 +20,11 @@ import (
 	"hash/crc32"
 	"net"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/chubaofs/chubaofs/proto"
 	"github.com/chubaofs/chubaofs/repl"
 	"github.com/chubaofs/chubaofs/storage"
-	"github.com/chubaofs/chubaofs/util"
 	"github.com/chubaofs/chubaofs/util/errors"
 	"github.com/chubaofs/chubaofs/util/exporter"
 	"github.com/chubaofs/chubaofs/util/log"
@@ -59,6 +57,8 @@ func (e *EcNode) OperatePacket(p *repl.Packet, c *net.TCPConn) (err error) {
 	switch p.Opcode {
 	case proto.OpCreateEcDataPartition:
 		e.handlePacketToCreateEcPartition(p)
+	case proto.OpUpdateEcDataPartition:
+		e.handleUpdateEcPartition(p)
 	case proto.OpEcNodeHeartbeat:
 		e.handleHeartbeatPacket(p)
 	case proto.OpCreateExtent:
@@ -67,14 +67,18 @@ func (e *EcNode) OperatePacket(p *repl.Packet, c *net.TCPConn) (err error) {
 		e.handleWritePacket(p)
 	case proto.OpRead:
 		e.handleReadPacket(p, c)
-	case proto.OpStreamRead:
+	case proto.OpStreamRead, proto.OpStreamFollowerRead:
 		e.handleStreamReadPacket(p, c)
-	case proto.OpStreamFollowerRead:
-		e.handleStreamReadPacket(p, c)
+	case proto.OpNotifyReplicasToRepair:
+		e.handleRepairWrite(p)
 	case proto.OpChangeEcPartitionMembers:
-		e.handelChangeMember(p)
-	case proto.OpListExtentsInPartition:
-		e.handelListExtentAndUpdatePartition(p, c)
+		e.handleChangeMember(p)
+	case proto.OpGetAllWatermarks:
+		e.handleGetAllWatermarks(p)
+	case proto.OpEcExtentValidate:
+		e.handleEcExtentValidate(p)
+	case proto.OpEcExtentRepair:
+		e.handleEcExtentRepair(p)
 	default:
 		p.PackErrorBody(repl.ErrorUnknownOp.Error(), repl.ErrorUnknownOp.Error()+strconv.Itoa(int(p.Opcode)))
 	}
@@ -186,18 +190,18 @@ func (e *EcNode) handlePacketToCreateExtent(p *repl.Packet) {
 
 	extentId := p.ExtentID
 	if extentId == 0 {
-		log.LogDebugf("master->ecnode createExtent, packet:%v", p)
+		log.LogDebugf("codecnode->ecnode createExtent, packet:%v", p)
 		// codecnode -> ecnode for create extent
 		extentId, err = ep.GetNewExtentId()
 		if err != nil {
-			log.LogDebugf("master->ecnode GetNewExtentId fail, error:%v", err)
+			log.LogDebugf("codecnode->ecnode GetNewExtentId fail, error:%v", err)
 			err = storage.NoBrokenExtentError
 			return
 		}
 
 		ok := e.createExtentOnFollower(ep, extentId)
 		if !ok {
-			log.LogDebugf("master->ecnode createExtentOnFollower fail, newExtentId:%v", extentId)
+			log.LogDebugf("codecnode->ecnode createExtentOnFollower fail, newExtentId:%v", extentId)
 			err = storage.BrokenExtentError
 			return
 		}
@@ -212,9 +216,8 @@ func (e *EcNode) handlePacketToCreateExtent(p *repl.Packet) {
 	return
 }
 
+// Handle OpWrite packet.
 func (e *EcNode) handleWritePacket(p *repl.Packet) {
-	log.LogDebugf("ActionWrite")
-
 	var err error
 	defer func() {
 		if err != nil {
@@ -224,49 +227,27 @@ func (e *EcNode) handleWritePacket(p *repl.Packet) {
 		}
 	}()
 
-	partition := p.Object.(*EcPartition)
-	if partition.Available() <= 0 || partition.disk.Status == proto.ReadOnly || partition.IsRejectWrite() {
+	ep := p.Object.(*EcPartition)
+	if ep.Available() <= 0 || ep.disk.Status == proto.ReadOnly || ep.IsRejectWrite() {
 		err = storage.NoSpaceError
 		return
-	} else if partition.disk.Status == proto.Unavailable {
+	} else if ep.disk.Status == proto.Unavailable {
 		err = storage.BrokenDiskError
 		return
 	}
 
-	store := partition.ExtentStore()
 	// we only allow write by one stripe unit
-	if uint64(p.Size)%partition.StripeUnitSize != 0 && uint64(p.Size) > partition.ExtentFileSize {
+	if uint64(p.Size)%ep.StripeUnitSize != 0 && uint64(p.Size) > ep.ExtentFileSize {
 		err = errors.New("invalid size, must be in range (StripeUnitSize, ExtentFileSize)")
 		return
 	}
 
-	if p.Size <= util.BlockSize {
-		err = store.Write(p.ExtentID, p.ExtentOffset, int64(p.Size), p.Data, p.CRC, storage.AppendWriteType, p.IsSyncWrite())
-		partition.checkIsDiskError(err)
-	} else {
-		size := p.Size
-		offset := 0
-		for size > 0 {
-			if size <= 0 {
-				break
-			}
-			currSize := util.Min(int(size), util.BlockSize)
-			data := p.Data[offset : offset+currSize]
-			crc := crc32.ChecksumIEEE(data)
-			err = store.Write(p.ExtentID, p.ExtentOffset+int64(offset), int64(currSize), data, crc,
-				storage.AppendWriteType, p.IsSyncWrite())
-			partition.checkIsDiskError(err)
-			if err != nil {
-				break
-			}
-			size -= uint32(currSize)
-			offset += currSize
-		}
-	}
+	ecStripe, _ := NewEcStripe(e, ep, p.ExtentID)
+	err = ecStripe.writeToExtent(p, storage.AppendWriteType)
 	e.incDiskErrCnt(p.PartitionID, err, WriteFlag)
-	return
 }
 
+// Handle OpStreamFollowerRead & OpStreamRead packet.
 func (e *EcNode) handleStreamReadPacket(p *repl.Packet, connect net.Conn) {
 	var err error
 	defer func() {
@@ -281,8 +262,7 @@ func (e *EcNode) handleStreamReadPacket(p *repl.Packet, connect net.Conn) {
 	}()
 
 	ep := p.Object.(*EcPartition)
-
-	ecExtent := NewEcExtent(e, ep, p.ExtentID)
+	ecStripe, _ := NewEcStripe(e, ep, p.ExtentID)
 	readSize := uint64(p.Size)
 	extentOffset := uint64(p.ExtentOffset)
 	for {
@@ -290,20 +270,20 @@ func (e *EcNode) handleStreamReadPacket(p *repl.Packet, connect net.Conn) {
 			break
 		}
 
-		nodeAddr := ecExtent.calcNode(extentOffset)
-		extentFileOffset := ecExtent.calcExtentFileOffset(extentOffset)
-		curReadSize := ecExtent.calcCanReadSize(extentOffset, readSize)
-		data, crc, err := ecExtent.readStripeData(nodeAddr, extentFileOffset, curReadSize)
-		log.LogDebugf("StreamRead readStripeData: %v %v %v %v %v %v", nodeAddr, extentFileOffset, curReadSize, len(data), crc, err)
-		if err != nil {
-			data, err = ecExtent.reconstructStripeData(nodeAddr, extentFileOffset, curReadSize)
-			if err != nil {
-				err = errors.NewErrorf("StreamRead reconstruct Stripe Data fail, ReqID(%v) PartitionID(%v) ExtentID(%v) ExtentOffset(%v) Size(%v) nodeAddr(%v) extentFileOffset(%v) curReadSize(%v) err:%v",
-					p.ReqID, p.PartitionID, p.ExtentID, p.ExtentOffset, p.Size, nodeAddr, extentFileOffset, curReadSize, err)
+		nodeAddr := ecStripe.calcNode(extentOffset)
+		extentFileOffset := ecStripe.calcExtentFileOffset(extentOffset)
+		curReadSize := ecStripe.calcCanReadSize(extentOffset, readSize)
+		data, crc, err := ecStripe.readStripeData(nodeAddr, extentFileOffset, curReadSize)
+		log.LogDebugf("StreamRead reply packet: PartitionID(%v) ExtentID(%v) nodeAddr(%v) offset(%v) readSize(%v) actual dataSize(%v) crc(%v) err:%v",
+			p.PartitionID, p.ExtentID, nodeAddr, extentFileOffset, curReadSize, len(data), crc, err)
+		if err != nil || len(data) == 0 {
+			// repair read process
+			data, crc, err = repairReadStripeProcess(ecStripe, extentFileOffset, curReadSize, p, nodeAddr)
+			if err != nil || len(data) == 0 {
+				err = errors.NewErrorf("StreamRead repairReadStripeProcess fail, ReqID(%v) PartitionID(%v) ExtentID(%v) ExtentOffset(%v) nodeAddr(%v) extentFileOffset(%v) curReadSize(%v) dataSize(%v). err:%v",
+					p.ReqID, p.PartitionID, p.ExtentID, p.ExtentOffset, nodeAddr, extentFileOffset, curReadSize, len(data), err)
 				return
 			}
-
-			crc = crc32.ChecksumIEEE(data)
 		}
 
 		reply := NewReadReply(p)
@@ -319,7 +299,6 @@ func (e *EcNode) handleStreamReadPacket(p *repl.Packet, connect net.Conn) {
 			return
 		}
 
-		log.LogDebugf("StreamRead reply packet:%v ExtentOffset[%v] Size[%v] Crc[%v]", reply, reply.ExtentOffset, reply.Size, reply.CRC)
 		extentOffset += curReadSize
 		readSize -= curReadSize
 	}
@@ -327,6 +306,24 @@ func (e *EcNode) handleStreamReadPacket(p *repl.Packet, connect net.Conn) {
 	p.PacketOkReply()
 }
 
+func repairReadStripeProcess(ecStripe *ecStripe, extentFileOffset uint64, curReadSize uint64, p *repl.Packet, nodeAddr string, ) (data []byte, crc uint32, err error) {
+	repairData, err := ecStripe.repairStripeData(extentFileOffset, curReadSize)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	for i := 0; i < len(ecStripe.hosts); i++ {
+		if ecStripe.hosts[i] == nodeAddr && len(repairData[i]) > 0 {
+			data = repairData[i]
+			crc = crc32.ChecksumIEEE(data)
+			return data, crc, nil
+		}
+	}
+
+	return nil, 0, errors.NewErrorf("repairStripeData is empty")
+}
+
+// Handle OpRead packet.
 func (e *EcNode) handleReadPacket(p *repl.Packet, c *net.TCPConn) {
 	var err error
 	defer func() {
@@ -339,49 +336,78 @@ func (e *EcNode) handleReadPacket(p *repl.Packet, c *net.TCPConn) {
 		}
 	}()
 
-	packet := NewReadReply(p)
 	partition := p.Object.(*EcPartition)
-	// only allow write by one stripe unit
-	if p.Size == 0 || uint64(p.Size) > partition.StripeUnitSize {
+	// only allow read by one stripe unit
+	if uint64(p.Size) != partition.StripeUnitSize {
 		err = errors.New("invalid read size, must be equals StripeUnitSize")
 		return
 	}
 
-	packet.Data = make([]byte, p.Size)
+	ecStripe, _ := NewEcStripe(e, partition, p.ExtentID)
+	data := make([]byte, p.Size)
 	tpObject := exporter.NewTPCnt(p.GetOpMsg())
-	extent := NewEcExtent(e, partition, packet.ExtentID)
-	packet.CRC, err = extent.readExtentFile(uint64(packet.ExtentOffset), uint64(packet.Size), packet.Data)
+	crc, err := ecStripe.readExtentFile(uint64(p.ExtentOffset), uint64(p.Size), data)
 	partition.checkIsDiskError(err)
 	tpObject.Set(err)
-	if err == nil {
-		packet.ResultCode = proto.OpOk
-		log.LogDebugf("Read reply packet:%v ExtentOffset[%v] Size[%v] Crc[%v], err:%v", packet, packet.ExtentOffset, packet.Size, packet.CRC, err)
-		err = packet.WriteToConn(c)
-		if err != nil {
-			log.LogErrorf("Read write to client fail. packet:%v err:%v", packet, err)
-		}
+	if err != nil {
+		log.LogErrorf("fail to read extent. ReqID(%v) PartitionID(%v) ExtentId(%v) ExtentOffset[%v] Size[%v] err:%v",
+			p.ReqID, p.PartitionID, p.ExtentID, p.ExtentOffset, p.Size, err)
+		data = nil
+		return
+	}
+
+	p.Data = data
+	p.CRC = crc
+	p.ResultCode = proto.OpOk
+	log.LogDebugf("read extent success, ReqID(%v) PartitionID(%v) ExtentId(%v)", p.ReqID, p.PartitionID, p.ExtentID)
+	err = p.WriteToConn(c)
+	if err != nil {
+		log.LogErrorf("write reply packet error. ReqID(%v) PartitionID(%v) ExtentId(%v) ExtentOffset[%v] Size[%v] Crc[%v] err:%v",
+			p.ReqID, p.PartitionID, p.ExtentID, p.ExtentOffset, p.Size, p.CRC, err)
+		return
 	}
 
 	p.PacketOkReply()
 }
 
-func (e *EcNode) handelListExtentAndUpdatePartition(p *repl.Packet, conn *net.TCPConn) {
+// Handle OpGetAllWatermarks packet.
+func (e *EcNode) handleGetAllWatermarks(p *repl.Packet) {
 	var err error
 	defer func() {
 		if err != nil {
-			p.PackErrorBody("handelChangeMember", err.Error())
-		} else {
-			p.PacketOkReply()
+			log.LogErrorf("%v packet:%v error: %v", ActionGetAllExtentWatermarks, p, err)
+			p.PackErrorBody(ActionGetAllExtentWatermarks, err.Error())
 		}
 	}()
 
+	ep := e.space.Partition(p.PartitionID)
+	if ep == nil {
+		err = proto.ErrNoAvailEcPartition
+		return
+	}
+
+	extentList, err := ep.listExtentsLocal()
+	if err != nil {
+		err = errors.NewErrorf("list extent fail, err:%v", err)
+		return
+	}
+
+	buf, err := json.Marshal(extentList)
+	if err != nil {
+		err = errors.NewErrorf("marshal extent list fail, err:%v", err)
+		return
+	}
+
+	p.PacketOkWithBody(buf)
 }
 
-func (e *EcNode) handelChangeMember(p *repl.Packet) {
+// Handle OpChangeEcPartitionMembers packet.
+func (e *EcNode) handleChangeMember(p *repl.Packet) {
 	var err error
 	defer func() {
 		if err != nil {
-			p.PackErrorBody("handelChangeMember", err.Error())
+			log.LogErrorf("%v fail. packet:%v data:%v err:%v", ActionChangeMember, p, string(p.Data), err)
+			p.PackErrorBody(ActionChangeMember, err.Error())
 		} else {
 			p.PacketOkReply()
 		}
@@ -393,21 +419,127 @@ func (e *EcNode) handelChangeMember(p *repl.Packet) {
 		return
 	}
 
-	//ep.partitionStatus = proto.ReadOnly
-	task := proto.AdminTask{}
-	err = json.Unmarshal(p.Data, task)
-	request := task.Request.(proto.ChangeEcPartitionMembersRequest)
-	count := 0
-	wg := sync.WaitGroup{}
-	for _, host := range request.Hosts {
-		wg.Add(1)
-		go e.listExtentAndUpdatePartition(ep, host, &count)
+	log.LogDebugf("change member PartitionID(%v) data:%v", p.PartitionID, string(p.Data))
+	r, err := getChangeEcPartitionMemberRequest(p.Data)
+	if err != nil {
+		return
 	}
 
-	wg.Wait()
-	if count == len(request.Hosts) {
-		p.PacketOkReply()
-	} else {
+	if len(r.Hosts) != int(ep.DataNodeNum+ep.ParityNodeNum) {
+		err = errors.NewErrorf("no enough new hosts for change member, err:%v", err)
+		return
 	}
 
+	err = ep.changeMember(e, r, p.Data)
+}
+
+// Handle OpNotifyReplicasToRepair packet.
+func (e *EcNode) handleRepairWrite(p *repl.Packet) {
+	var err error
+	defer func() {
+		if err != nil {
+			p.PackErrorBody(ActionReplicasToRepair, err.Error())
+		} else {
+			p.PacketOkReply()
+		}
+	}()
+
+	log.LogDebugf("RepairWrite PartitionID(%v) ExtentId(%v) offset(%v) size(%v) data len(%v), crc(%v)",
+		p.PartitionID, p.ExtentID, p.ExtentOffset, p.Size, len(p.Data), p.CRC)
+
+	ep := p.Object.(*EcPartition)
+	if uint64(p.Size) != ep.StripeUnitSize {
+		err = errors.NewErrorf("data size must be equals a StripeUnitSize(%v)", ep.StripeUnitSize)
+		return
+	}
+
+	store := ep.extentStore
+	if !store.HasExtent(p.ExtentID) {
+		// create ExtentFile
+		err = store.Create(p.ExtentID)
+		if err != nil {
+			err = errors.NewErrorf("RepairWrite createExtent fail, err:%v", err)
+			return
+		}
+	}
+
+	ecStripe, _ := NewEcStripe(e, ep, p.ExtentID)
+	err = ecStripe.writeToExtent(p, storage.RandomWriteType)
+	e.incDiskErrCnt(p.PartitionID, err, WriteFlag)
+}
+
+// Handle OpUpdateEcDataPartition packet.
+func (e *EcNode) handleUpdateEcPartition(p *repl.Packet) {
+	var err error
+	defer func() {
+		if err != nil {
+			log.LogErrorf("UpdateEcPartition fail. PartitionID(%v) err:%v", p.PartitionID, err)
+			p.PackErrorBody(ActionUpdateEcPartition, err.Error())
+		} else {
+			p.PacketOkReply()
+		}
+	}()
+
+	ep := e.space.Partition(p.PartitionID)
+	if ep == nil {
+		err = proto.ErrNoAvailEcPartition
+		return
+	}
+
+	err = ep.updatePartitionLocal(p.Data)
+}
+
+// Handle OpEcExtentValidate packet.
+func (e *EcNode) handleEcExtentValidate(p *repl.Packet) {
+	var err error
+	defer func() {
+		if err != nil {
+			log.LogErrorf("EcExtentValidate fail, err:%v", err)
+			p.PackErrorBody(ActionValidateEcPartition, err.Error())
+		}
+	}()
+
+	ep := e.space.Partition(p.PartitionID)
+	if ep == nil {
+		err = proto.ErrNoAvailEcPartition
+		return
+	}
+
+	ecStripe, _ := NewEcStripe(e, ep, p.ExtentID)
+	extentInfo, err := ecStripe.validate()
+	if err != nil {
+		return
+	}
+
+	marshal, err := json.Marshal(extentInfo)
+	if err != nil {
+		err = errors.NewErrorf("EcExtentValidate success, but marshal extentInfo fail")
+		return
+	}
+
+	p.PacketOkWithBody(marshal)
+}
+
+func (e *EcNode) handleEcExtentRepair(p *repl.Packet) {
+	var err error
+	defer func() {
+		if err != nil {
+			log.LogErrorf("EcExtentRepair fail, err:%v", err)
+			p.PackErrorBody(ActionRepairRead, err.Error())
+		}
+	}()
+
+	log.LogDebugf("EcExtentRepair: ReqID(%v) PartitionID(%v) ExtentID(%v)", p.ReqID, p.PartitionID, p.ExtentID)
+	ep := p.Object.(*EcPartition)
+	extentInfo, err := ep.GetExtentInfo(p.ExtentID)
+	if err != nil {
+		return
+	}
+
+	err = ep.repairExtentData(e, extentInfo)
+	if err != nil {
+		return
+	}
+
+	p.PacketOkReply()
 }

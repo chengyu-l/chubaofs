@@ -16,17 +16,21 @@ package ecnode
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"github.com/chubaofs/chubaofs/proto"
+	"github.com/chubaofs/chubaofs/repl"
 	"github.com/chubaofs/chubaofs/storage"
+	"github.com/chubaofs/chubaofs/util/errors"
 	"github.com/chubaofs/chubaofs/util/log"
+	"hash/crc32"
 	"io/ioutil"
 	"math"
 	"net"
 	"os"
 	"path"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -52,6 +56,7 @@ type EcPartition struct {
 
 	intervalToUpdatePartitionSize int64
 	loadExtentHeaderStatus        int
+	metaFileLock                  sync.Mutex
 }
 
 type EcPartitionMetaData struct {
@@ -181,6 +186,9 @@ func (ep *EcPartition) statusUpdateScheduler() {
 
 // PersistMetaData persists the file metadata on the disk
 func (ep EcPartition) PersistMetaData() (err error) {
+	ep.metaFileLock.Lock()
+	defer ep.metaFileLock.Unlock()
+
 	tempFileFilePath := path.Join(ep.Path(), TempMetaDataFileName)
 	metadataFile, err := os.OpenFile(tempFileFilePath, os.O_CREATE|os.O_RDWR, 0666)
 	if err != nil {
@@ -337,4 +345,285 @@ func (ep *EcPartition) remoteRead(nodeIndex uint32, extentID uint64, offset int6
 
 func (ep *EcPartition) GetNewExtentId() (uint64, error) {
 	return ep.extentStore.NextExtentID()
+}
+
+func (ep *EcPartition) GetExtentInfo(extentId uint64) (*storage.ExtentInfo, error) {
+	return ep.extentStore.Watermark(extentId)
+}
+
+
+func (ep *EcPartition) updatePartitionLocal(data []byte) (err error) {
+	request, err := getChangeEcPartitionMemberRequest(data)
+	if err != nil {
+		return err
+	}
+
+	newHosts := request.Hosts
+	ep.Hosts = newHosts
+	err = ep.PersistMetaData()
+	return
+}
+
+func getChangeEcPartitionMemberRequest(data []byte) (*proto.ChangeEcPartitionMembersRequest, error) {
+	request := &proto.ChangeEcPartitionMembersRequest{}
+	task := proto.AdminTask{}
+	task.Request = request
+	err := json.Unmarshal(data, &task)
+	if err != nil {
+		return nil, err
+	}
+
+	return request, nil
+}
+
+func (ep *EcPartition) changeMember(e *EcNode, r *proto.ChangeEcPartitionMembersRequest, data []byte) error {
+	err := ep.updatePartitionAllEcNode(e, r, data)
+	if err != nil {
+		return err
+	}
+
+	m, list, err := ep.listExtentsAllEcNode(e, r)
+	if err != nil {
+		return err
+	}
+
+	if isChangeMember(m, list) {
+		e.repairEvent <- repairEvent{ep: *ep, maxExtentInfoEcNode: m, extentInfoEcNodeList: list}
+	} else {
+		log.LogWarnf("PartitionID[%v] no need change member. maxExtentInfoEcNode:(nodeAddr:%v maxExtentId:%v extent len:%v) list len(%v) ",
+			ep.PartitionID, m.nodeAddr, m.maxExtentId, len(m.extentInfoMap), len(list))
+	}
+	return nil
+}
+
+func isChangeMember(m *extentInfoEcNode, list []*extentInfoEcNode) bool {
+	return m != nil && len(m.extentInfoMap) > 0 && len(list) > 0
+}
+
+func (ep *EcPartition) listExtentsAllEcNode(e *EcNode, r *proto.ChangeEcPartitionMembersRequest) (*extentInfoEcNode, []*extentInfoEcNode, error) {
+	extentInfoEcNodeList := make([]*extentInfoEcNode, len(r.Hosts))
+	wg := sync.WaitGroup{}
+	wg.Add(len(r.Hosts))
+	for i, host := range r.Hosts {
+		go ep.listExtents(i, host, e, &wg, extentInfoEcNodeList)
+	}
+	wg.Wait()
+
+	if len(extentInfoEcNodeList) < int(ep.DataNodeNum) {
+		return nil, nil, errors.NewErrorf("length of extentInfoEcNodeList cannot less than DataNodeNum, PartitionID(%v) length(%v) DataNodeNum(%v)",
+			ep.PartitionID, len(extentInfoEcNodeList), ep.DataNodeNum)
+	}
+
+	var maxExtentIndex = 0
+	var maxExtentId = extentInfoEcNodeList[0].maxExtentId
+	for i, extent := range extentInfoEcNodeList {
+		if extent.maxExtentId > maxExtentId {
+			maxExtentId = extent.maxExtentId
+			maxExtentIndex = i
+		}
+	}
+
+	maxExtentInfoEcNode := extentInfoEcNodeList[maxExtentIndex]
+	return maxExtentInfoEcNode, extentInfoEcNodeList, nil
+}
+
+func (ep *EcPartition) updatePartition(nodeAddr string, data []byte, e *EcNode, wg *sync.WaitGroup, count *int32) {
+	defer wg.Done()
+	if nodeAddr == e.localServerAddr {
+		// change member local
+		err := ep.updatePartitionLocal(data)
+		if err != nil {
+			log.LogErrorf("updatePartitionLocal fail, PartitionID(%v), err:%v", ep.PartitionID, err)
+			return
+		}
+
+		atomic.AddInt32(count, 1)
+	} else {
+		// change member on follower
+		err := updatePartitionFollower(ep, data, nodeAddr)
+		if err != nil {
+			log.LogErrorf("updatePartitionFollower fail, PartitionID(%v)", ep.PartitionID)
+			return
+		}
+
+		atomic.AddInt32(count, 1)
+	}
+}
+
+func updatePartitionFollower(ep *EcPartition, data []byte, nodeAddr string) error {
+	request := repl.NewPacket()
+	request.ReqID = proto.GenerateRequestID()
+	request.PartitionID = ep.PartitionID
+	request.Opcode = proto.OpUpdateEcDataPartition
+	request.Data = data
+	request.Size = uint32(len(data))
+	request.CRC = crc32.ChecksumIEEE(data)
+	err := DoRequest(request, nodeAddr, proto.ReadDeadlineTime)
+	if err != nil || request.ResultCode != proto.OpOk {
+		return errors.NewErrorf("request OpUpdateEcDataPartition fail. node(%v) resultCode(%v) err:%v", nodeAddr, request.ResultCode, err)
+	}
+
+	return nil
+}
+
+func (ep *EcPartition) listExtents(i int, nodeAddr string, e *EcNode, wg *sync.WaitGroup, extentInfos []*extentInfoEcNode) {
+	defer wg.Done()
+	if nodeAddr == e.localServerAddr {
+		list, err := ep.listExtentsLocal()
+		if err != nil {
+			log.LogErrorf("listExtentsLocal fail, PartitionID(%v), err:%v", ep.PartitionID, err)
+			return
+		}
+
+		extentInfos[i] = ep.convertToExtentInfosEcNode(list, nodeAddr)
+	} else {
+		list, err := ep.listExtentsFollower(nodeAddr)
+		if err != nil {
+			log.LogErrorf("listExtentsFollower fail, PartitionID(%v), err:%v", ep.PartitionID, err)
+			return
+		}
+
+		extentInfos[i] = ep.convertToExtentInfosEcNode(list, nodeAddr)
+	}
+}
+
+func (ep *EcPartition) listExtentsLocal() (fInfoList []*storage.ExtentInfo, err error) {
+	store := ep.ExtentStore()
+	fInfoList, _, err = store.GetAllWatermarks(storage.NormalExtentFilter())
+	return fInfoList, err
+}
+
+func (ep *EcPartition) convertToExtentInfosEcNode(extentInfoList []*storage.ExtentInfo, nodeAddr string) *extentInfoEcNode {
+	p := &extentInfoEcNode{
+		nodeAddr:      nodeAddr,
+		partitionId:   ep.PartitionID,
+		extentInfoMap: make(map[uint64]*storage.ExtentInfo),
+	}
+
+	maxExtentId := uint64(0)
+	for _, file := range extentInfoList {
+		extentId := file.FileID
+		p.extentInfoMap[extentId] = file
+		if extentId > maxExtentId {
+			maxExtentId = extentId
+		}
+	}
+
+	p.maxExtentId = maxExtentId
+	return p
+}
+
+func (ep *EcPartition) updatePartitionAllEcNode(e *EcNode, r *proto.ChangeEcPartitionMembersRequest, data []byte) error {
+	count := int32(0)
+	wg := sync.WaitGroup{}
+	wg.Add(len(r.Hosts))
+	for _, host := range r.Hosts {
+		go ep.updatePartition(host, data, e, &wg, &count)
+	}
+	wg.Wait()
+
+	if count != int32(len(r.Hosts)) {
+		return errors.NewErrorf("updatePartitionAllEcNode fail, PartitionID[%v]", ep.PartitionID)
+	}
+
+	return nil
+}
+
+func (ep *EcPartition) repairExtentData(ec *EcNode, info *storage.ExtentInfo) error {
+	ecStripe, _ := NewEcStripe(ec, ep, info.FileID)
+	extentFileOffset := uint64(0)
+	for {
+		if extentFileOffset >= info.Size {
+			break
+		}
+
+		_, err := ecStripe.repairStripeData(extentFileOffset, ep.StripeUnitSize)
+		if err != nil {
+			return err
+		}
+
+		extentFileOffset += ep.StripeUnitSize
+	}
+
+	return nil
+}
+
+func (ep *EcPartition) listExtentsFollower(nodeAddr string) ([]*storage.ExtentInfo, error) {
+	request := repl.NewPacket()
+	request.ReqID = proto.GenerateRequestID()
+	request.PartitionID = ep.PartitionID
+	request.Opcode = proto.OpGetAllWatermarks
+	err := DoRequest(request, nodeAddr, proto.ReadDeadlineTime)
+	if err != nil {
+		return nil, errors.NewErrorf("request OpGetAllWatermarks fail. node(%v) err:%v", nodeAddr, err)
+	}
+
+	if request.ResultCode != proto.OpOk || len(request.Data) == 0 {
+		if len(request.Data) > 0 {
+			return nil, errors.NewErrorf("OpGetAllWatermarks node(%v) resultCode(%v) data:%v", nodeAddr, request.ResultCode, string(request.Data))
+		} else {
+			return nil, errors.NewErrorf("OpGetAllWatermarks node(%v) resultCode(%v)", nodeAddr, request.ResultCode)
+		}
+	}
+
+	var list []*storage.ExtentInfo
+	err = json.Unmarshal(request.Data, &list)
+	if err != nil {
+		return nil, errors.NewErrorf("unmarshal ExtentInfo fail. data:%v err:%v", string(request.Data), err)
+	}
+
+	return list, nil
+}
+
+func (ep *EcPartition) repairPartitionData(ec *EcNode, maxExtentInfoEcNode *extentInfoEcNode, extentInfoEcNodeList []*extentInfoEcNode) {
+	log.LogDebugf("repairPartitionData PartitionID(%v) node(%v) extent size(%v)",
+		ep.PartitionID, maxExtentInfoEcNode.nodeAddr, len(maxExtentInfoEcNode.extentInfoMap))
+
+	maxExtentInfoMap := maxExtentInfoEcNode.extentInfoMap
+	for extentId := range maxExtentInfoMap {
+		extentInfo := maxExtentInfoMap[extentId]
+		if extentInfo == nil {
+			log.LogWarnf("PartitionID(%v) node(%v) cannot repair this extent, ExtentID(%v) not exist ",
+				ep.PartitionID, maxExtentInfoEcNode.nodeAddr, extentId)
+			continue
+		}
+
+		count := 0
+		for _, extentInfoEcNode := range extentInfoEcNodeList {
+			otherExtentInfo, ok := extentInfoEcNode.extentInfoMap[extentId]
+			if ok && otherExtentInfo != nil && extentInfo.Size == otherExtentInfo.Size {
+				count += 1
+			}
+		}
+
+		if canRepair(count, ep, extentInfo) {
+			err := ep.repairExtentData(ec, extentInfo)
+			if err != nil {
+				log.LogErrorf("fail to repair this extent, PartitionID(%v) ExtentID(%v) extentInfo(%v) err:%v",
+					maxExtentInfoEcNode.partitionId, extentId, extentInfo.String(), err)
+			}
+		} else {
+			log.LogWarnf("cannot repair this extent, PartitionID(%v) ExtentID(%v) extentInfo(%v)",
+				maxExtentInfoEcNode.partitionId, extentId, extentInfo.String())
+		}
+	}
+}
+
+func canRepair(count int, ep *EcPartition, extentInfo *storage.ExtentInfo) bool {
+	if count < int(ep.DataNodeNum) {
+		// cannot repair, because of no enough ecNode with this extent
+		return false
+	}
+
+	if extentInfo.Size == 0 {
+		// cannot repair, this extent is empty(size is zero)
+		return false
+	}
+
+	if count == int(ep.DataNodeNum+ep.ParityNodeNum) {
+		// no need repair, all EcNode extent are same
+		return false
+	}
+
+	return true
 }

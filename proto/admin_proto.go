@@ -295,6 +295,7 @@ type EcPartitionReport struct {
 	IsRecover       bool
 	NodeIndex       uint32
 }
+
 // DataNodeHeartbeatResponse defines the response to the data node heartbeat.
 type DataNodeHeartbeatResponse struct {
 	Total               uint64
@@ -500,7 +501,7 @@ func NewVolView(name string, status uint8, followerRead bool, createTime int64) 
 	view.Status = status
 	view.MetaPartitions = make([]*MetaPartitionView, 0)
 	view.DataPartitions = make([]*DataPartitionResponse, 0)
-	view.EcPartitions   = make([]*EcPartitionResponse, 0)
+	view.EcPartitions = make([]*EcPartitionResponse, 0)
 	return
 }
 
@@ -559,15 +560,15 @@ type EcNodeHeartbeatResponse struct {
 
 // CreateEcPartitionRequest defines the request to create a ec partition.
 type CreateEcPartitionRequest struct {
-	PartitionID uint64
-	PartitionSize uint64
-	VolumeID string
+	PartitionID    uint64
+	PartitionSize  uint64
+	VolumeID       string
 	StripeUnitSize uint64
 	ExtentFileSize uint64
-	DataNodeNum uint32
-	ParityNodeNum uint32
-	NodeIndex uint32
-	Hosts []string
+	DataNodeNum    uint32
+	ParityNodeNum  uint32
+	NodeIndex      uint32
+	Hosts          []string
 }
 
 // CreateEcPartitionResponse defines the response to the request of creating a ec partition.
@@ -608,6 +609,11 @@ type ChangeEcPartitionMembersRequest struct {
 	DataPartitionType string
 	PartitionId       uint64
 	Hosts             []string
+}
+
+type ListEcExtentFileRequest struct {
+	PartitionId uint64
+	Files []*File
 }
 
 // ChangeEcPartitionMembersRequest defines the response to the request of changing members of a ec partition.

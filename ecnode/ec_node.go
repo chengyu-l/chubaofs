@@ -1,14 +1,21 @@
 package ecnode
 
 import (
-	"fmt"
 	"github.com/chubaofs/chubaofs/proto"
 	"github.com/chubaofs/chubaofs/repl"
+	"github.com/chubaofs/chubaofs/storage"
 	"github.com/chubaofs/chubaofs/util/log"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+type extentInfoEcNode struct {
+	extentInfoMap map[uint64]*storage.ExtentInfo
+	nodeAddr      string
+	partitionId   uint64
+	maxExtentId   uint64
+}
 
 func (e *EcNode) createExtentOnFollower(ep *EcPartition, extentId uint64) bool {
 	var count int32
@@ -19,17 +26,18 @@ func (e *EcNode) createExtentOnFollower(ep *EcPartition, extentId uint64) bool {
 			defer wg.Done()
 
 			if addr == e.localServerAddr {
-				// create extent locally
+				// create extent local
 				if err := ep.ExtentStore().Create(extentId); err != nil {
-					log.LogErrorf("NewCreateExtent locally addr:%v partition:%d extentId:%d error:%v",
+					log.LogErrorf("fail to create extent local. node(%v) partitionID(%v) extentID(%d) error:%v",
 						addr, ep.PartitionID, extentId, err)
 					return
 				}
 			} else {
+				// create extent from remote node
 				request := NewCreateExtent(ep.PartitionID, extentId)
 				err := DoRequest(request, addr, proto.ReadDeadlineTime)
 				if err != nil || request.ResultCode != proto.OpOk {
-					log.LogErrorf("NewCreateExtent addr:%v partition:%d extentId:%d error:%v ",
+					log.LogErrorf("fail to create extent from remote. node(%v) partitionID(%v) extentID(%d) error:%v ",
 						addr, ep.PartitionID, extentId, err)
 					return
 				}
@@ -40,8 +48,7 @@ func (e *EcNode) createExtentOnFollower(ep *EcPartition, extentId uint64) bool {
 	}
 
 	wg.Wait()
-	fmt.Printf("master->ecnode createExtent[%v], success count:%d node total count:%d\n", extentId, count, len(ep.Hosts))
-	log.LogDebugf("master->ecnode createExtent[%v], success count:%d node total count:%d", extentId, count, len(ep.Hosts))
+	log.LogDebugf("codecnode->ecnode create extent[%v] success, success count(%v) total count(%v)", extentId, count, len(ep.Hosts))
 	if int(count) == len(ep.Hosts) {
 		return true
 	} else {
@@ -58,8 +65,4 @@ func NewCreateExtent(partitionID uint64, extentID uint64) (p *repl.Packet) {
 	p.ReqID = proto.GenerateRequestID()
 	p.StartT = time.Now().UnixNano()
 	return
-}
-
-func (e *EcNode) listExtentAndUpdatePartition(ep *EcPartition, host string, i *int) {
-
 }

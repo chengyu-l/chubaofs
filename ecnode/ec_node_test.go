@@ -20,7 +20,7 @@ const (
 	//testBasePath    = "/tmp/cfs"
 	testBasePath = "/Users/liuchengyu/cfs"
 	testDiskPath = testBasePath + "/disk"
-	fakeExtentId = 1001
+	fakeExtentId = 1025
 )
 
 type fakeHandler func(e *fakeEcNode, p *repl.Packet, conn net.Conn)
@@ -28,14 +28,13 @@ type fakeHandler func(e *fakeEcNode, p *repl.Packet, conn net.Conn)
 type fakeEcNode struct {
 	EcNode
 	Hosts []string
+	path  string
 }
 
 func TestEcNode_handlePacketToCreateExtent(t *testing.T) {
-
-	// clean data
-	defer os.RemoveAll(testBasePath)
-	e := newFakeEcNode(t, fakeCreateExtentPacketHandle)
-	ep := e.fakeCreateECPartition(t, fakePartitionID)
+	ec := newFakeEcNode(t, fakeCreateExtentPacketHandle)
+	defer os.RemoveAll(ec.path)
+	ep := ec.fakeCreateECPartition(t, fakePartitionID)
 
 	p := &repl.Packet{
 		Object: ep,
@@ -48,7 +47,7 @@ func TestEcNode_handlePacketToCreateExtent(t *testing.T) {
 		},
 	}
 
-	e.handlePacketToCreateExtent(p)
+	ec.handlePacketToCreateExtent(p)
 	if p.ResultCode != proto.OpOk {
 		t.Fatalf("handlePacketToCreateExtent fail, error msg:%v", p.GetResultMsg())
 	}
@@ -56,13 +55,11 @@ func TestEcNode_handlePacketToCreateExtent(t *testing.T) {
 	if p.ExtentID == 0 {
 		t.Fatal("handlePacketToCreateExtent fail")
 	}
-	//fmt.Println(p, p.ExtentID)
 }
 
 func TestEcNode_createExtentOnFollower(t *testing.T) {
-	// clean data
-	defer os.RemoveAll(testBasePath)
 	e := newFakeEcNode(t, fakeCreateExtentPacketHandle)
+	defer os.RemoveAll(e.path)
 	ep := e.fakeCreateECPartition(t, fakePartitionID)
 	ok := e.createExtentOnFollower(ep, fakeExtentId)
 	if !ok {
@@ -71,6 +68,9 @@ func TestEcNode_createExtentOnFollower(t *testing.T) {
 }
 
 func newFakeEcNode(t *testing.T, handler fakeHandler) *fakeEcNode {
+	path := fmt.Sprintf("%s%d", testDiskPath, time.Now().Nanosecond())
+	_ = os.MkdirAll(path, 0766)
+
 	e := &fakeEcNode{
 		EcNode: EcNode{
 			clusterID:       "ecnode-cluster",
@@ -89,6 +89,7 @@ func newFakeEcNode(t *testing.T, handler fakeHandler) *fakeEcNode {
 			"127.0.0.1:17314",
 			"127.0.0.1:17315",
 		},
+		path: path,
 	}
 
 	wg := sync.WaitGroup{}
@@ -98,8 +99,6 @@ func newFakeEcNode(t *testing.T, handler fakeHandler) *fakeEcNode {
 	}
 	wg.Wait()
 
-	path := fmt.Sprintf("%s%d", testDiskPath, time.Now().Nanosecond())
-	_ = os.MkdirAll(path, 0766)
 	err := e.startSpaceManager(&config.Config{
 		Data: map[string]interface{}{
 			ConfigKeyDisks: []interface{}{

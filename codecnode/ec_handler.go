@@ -6,12 +6,12 @@ import (
 )
 
 type EcHandler struct {
-	blockSize           int
+	blockSize int
 
-	dataShardsNum       int
-	parityShardsNum     int
+	dataShardsNum   int
+	parityShardsNum int
 
-	encoder             reedsolomon.Encoder
+	encoder reedsolomon.Encoder
 }
 
 func NewEcHandler(blockSize, dataShardsNum, parityShardsNum int) (ech *EcHandler, err error) {
@@ -49,7 +49,7 @@ func (ech *EcHandler) GetEncodeSize() int {
 }
 
 func (ech *EcHandler) Encode(data []byte) (shards [][]byte, err error) {
-	if (len(data) != ech.blockSize * ech.dataShardsNum) {
+	if len(data) != ech.blockSize*ech.dataShardsNum {
 		err = errors.New("unmatched encode size")
 		return
 	}
@@ -77,7 +77,7 @@ func (ech *EcHandler) Encode(data []byte) (shards [][]byte, err error) {
 }
 
 func (ech *EcHandler) Reconstruct(shards [][]byte) (err error) {
-	if len(shards) != ech.dataShardsNum + ech.parityShardsNum {
+	if len(shards) != ech.dataShardsNum+ech.parityShardsNum {
 		err = errors.New("unmatched number of shards")
 		return err
 	}
@@ -101,4 +101,8 @@ func (ech *EcHandler) Reconstruct(shards [][]byte) (err error) {
 	err = ech.encoder.Reconstruct(shards)
 
 	return
+}
+
+func (ech *EcHandler) Verify(shards [][]byte) (verify bool, err error) {
+	return ech.encoder.Verify(shards)
 }
